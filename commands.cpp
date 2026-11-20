@@ -76,6 +76,8 @@ template <class T> void ReapplyMoveAnims(T& p) {
     else if constexpr (requires { p.ReapplyMoveAnims(); }) p.ReapplyMoveAnims();
     else if constexpr (requires { p.SetMoveAnim(); }) p.SetMoveAnim();
 }
+constexpr int kSpecialBaseId = 290;
+constexpr int kSpecialSlot   = 9; // slot 9 -> model ID 299 (less likely to collide with mission slots 0..3)
 
 void SwapPlayerModel(CPlayerPed* p, int newId) {
     const int oldId = (int)p->m_nModelIndex;
@@ -87,16 +89,22 @@ void SwapPlayerModel(CPlayerPed* p, int newId) {
 
     p->RemoveWeaponModel(-1);
     p->SetModelIndex(newId);
-    
+
+    // If we switched away from our special skin slot, release it now
+    if (oldId == kSpecialBaseId + kSpecialSlot && newId != oldId) {
+        CStreaming::SetSpecialCharIsDeletable(kSpecialSlot);
+    }
+
     if (newId == 0) {
         CClothes::RebuildPlayer(p, false);
+    } else {
+        ReapplyMoveAnims(*p);
     }
-    
+
     if (cur != WEAPONTYPE_UNARMED) {
         p->SetCurrentWeapon(cur);
     }
 }
-
 // ---------------------------------------------------------------- commands
 void CmdChangeMe(const Args& a) {
     int id;
@@ -121,36 +129,43 @@ void CmdChangeMe(const Args& a) {
     if (id != 0) CStreaming::SetModelIsDeletable(id);
     Ok("model -> " + std::to_string(id));
 }
-
 void CmdSkin(const Args& a) {
-    if (!a.Has(1)) { Usage("skin <name>"); return; }
-    const std::string name = ToUpper(a[1]);
+    if (!a.Has(1)) { Usage("skin <special_name>"); return; }
+
+    // SA special actor names are max 7 chars (8-byte buffer) and lowercase in IMG
+    if (a[1].size() > 7) {
+        Err("error: special actor name must be <= 7 chars (e.g. tenpen, sweet, ryder)");
+        return;
+    }
+    const std::string name = ToLower(a[1]);
 
     CPlayerPed* p = RequirePlayer();
     if (!p) return;
 
-    // 1. Load special char by name into Special 01 (Slot 1)
-    CStreaming::RequestSpecialChar(1, name.c_str(), GAME_REQUIRED);
-    
-    // 2. Load it normally (blocks until streamed)
+    const int modelId = kSpecialBaseId + kSpecialSlot;
+
+    // If already using this special slot, switch to CJ temporarily so the slot can reload cleanly
+    if (p->m_nModelIndex == modelId) {
+        SwapPlayerModel(p, 0);
+    }
+    CStreaming::SetSpecialCharIsDeletable(kSpecialSlot);
+
+    // 1. Request into kSpecialSlot (maps to modelId = 290 + kSpecialSlot)
+    CStreaming::RequestSpecialChar(kSpecialSlot, name.c_str(), GAME_REQUIRED);
     CStreaming::LoadAllRequestedModels(false);
 
-    // 3. Verify it loaded
-    if (!CStreaming::HasSpecialCharLoaded(1)) {
-        CStreaming::SetSpecialCharIsDeletable(1);
-        Err("error: model '" + name + "' failed to load");
+    // 2. Verify both special char flag and model load state
+    if (!CStreaming::HasSpecialCharLoaded(kSpecialSlot) || !ModelLoaded(modelId)) {
+        CStreaming::SetSpecialCharIsDeletable(kSpecialSlot);
+        Err("error: special actor '" + name + "' not found");
         return;
     }
 
-    // 4. Swap player model to 290 (Special 01)
-    SwapPlayerModel(p, 290);
-    
-    // 5. Unload the slot (the player's reference keeps the model in memory)
-    CStreaming::SetSpecialCharIsDeletable(1);
+    // 3. Swap player to matching modelId (290 + kSpecialSlot) — do NOT mark deletable yet
+    SwapPlayerModel(p, modelId);
 
     AddToHistory("skin applied -> " + name, kColGreen);
 }
-
 bool IsValidWeaponId(int id) { return id >= 0 && id <= kMaxWeaponId && !(id >= 19 && id <= 21); }
 
 void CmdWeapon(const Args& a) {
