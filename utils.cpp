@@ -83,18 +83,16 @@ int GetVehicleIdByName(std::string_view name) {
     auto it = cache.find(ToUpper(name));
     return it == cache.end() ? -1 : it->second;
 }
-
 int GetWeaponIdByName(std::string_view name) {
     if (name.empty()) return -1;
-    std::string tmp(name);                                  // FindWeaponType wants a mutable char*
+    std::string tmp = ToUpper(name);
+    // Replace spaces with underscores (e.g., "desert eagle" -> "DESERT_EAGLE")
+    std::replace(tmp.begin(), tmp.end(), ' ', '_');
+    
     const int id = (int)CWeaponInfo::FindWeaponType(tmp.data());
-    // An unknown name may come back as 0 (unarmed); only accept 0 if the user really asked for it.
-    if (id == 0 && ToLower(name) != "unarmed") return -1;
+    if (id == 0 && tmp != "UNARMED") return -1;
     return id;
 }
-
-// player.img directory lookup. Requesting a special model that is NOT in the archive is a
-// classic cause of crashes, so every skin request is checked here first.
 bool DoesModelExist(const std::string& name) {
     if (name.empty() || name.size() > 8) return false;
     CDirectory* dir = CStreaming::ms_pExtraObjectsDir;

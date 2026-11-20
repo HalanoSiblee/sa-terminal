@@ -1,11 +1,12 @@
 #include "terminal.h"
 #include <string_view>
+#include <vector>
+#include <algorithm>
 
 namespace {
 
 // ---------------------------------------------------------------- constants
 constexpr int   kMaxModels     = 20000;
-constexpr int   kFirstSpecial  = 290, kLastSpecial = 299;
 constexpr int   kFirstVehicle  = 400, kLastVehicle = 611;
 constexpr int   kMaxWeaponId   = 46;
 constexpr int   kWeatherCount  = 23;
@@ -59,24 +60,9 @@ CVehicle* RequireVehicle() {
     return v;
 }
 
-bool IsSpecialSlot(int id) { return id >= kFirstSpecial && id <= kLastSpecial; }
-
 bool ModelLoaded(int id) {
     return id >= 0 && id < kMaxModels && CModelInfo::ms_modelInfoPtrs[id]
         && CStreaming::ms_aInfoForModel[id].m_nLoadState == LOADSTATE_LOADED;
-}
-
-int PickSpecialSlot(const CPlayerPed& p) {
-    for (int slot = 1; slot <= 10; ++slot) {
-        int id = 289 + slot;
-        if (id == (int)p.m_nModelIndex) continue;
-        CBaseModelInfo* mi = CModelInfo::ms_modelInfoPtrs[id];
-        if (!mi || mi->m_nRefCount > 0) continue;
-        const int st = CStreaming::ms_aInfoForModel[id].m_nLoadState;
-        if (st != 0 && st != LOADSTATE_LOADED) continue;
-        return slot;
-    }
-    return -1;
 }
 
 template <class T> int GetActiveWeaponSlot(const T& p) {
@@ -90,6 +76,7 @@ template <class T> void ReapplyMoveAnims(T& p) {
     else if constexpr (requires { p.ReapplyMoveAnims(); }) p.ReapplyMoveAnims();
     else if constexpr (requires { p.SetMoveAnim(); }) p.SetMoveAnim();
 }
+
 void SwapPlayerModel(CPlayerPed* p, int newId) {
     const int oldId = (int)p->m_nModelIndex;
     if (oldId == newId) return;
@@ -98,31 +85,16 @@ void SwapPlayerModel(CPlayerPed* p, int newId) {
     const int slot = GetActiveWeaponSlot(*p);
     if (slot >= 0 && slot < 13) cur = p->m_aWeapons[slot].m_eWeaponType;
 
-    // 1. Remove weapon BEFORE changing model
     p->RemoveWeaponModel(-1);
-    
-    // 2. Change the model
     p->SetModelIndex(newId);
     
-    // 3. FIX: Pass 'false' because the group already exists
-    p->SetInitialState(false);
-    
-    // 4. Reapply move animations
-    if constexpr (requires { p->ReApplyMoveAnims(); }) {
-        p->ReApplyMoveAnims();
-    }
-    
-    // 5. Rebuild CJ's clothes
     if (newId == 0) {
         CClothes::RebuildPlayer(p, false);
     }
     
-    // 6. Re-equip weapon
     if (cur != WEAPONTYPE_UNARMED) {
         p->SetCurrentWeapon(cur);
     }
-
-    if (IsSpecialSlot(oldId)) CStreaming::SetModelIsDeletable(oldId);
 }
 
 // ---------------------------------------------------------------- commands
@@ -130,7 +102,6 @@ void CmdChangeMe(const Args& a) {
     int id;
     if (!ParseInt(a[1], id)) { Usage("changeme <ped_id>"); return; }
     if (id < 0 || id >= kMaxModels) { Err("error: id out of bounds"); return; }
-    if (IsSpecialSlot(id)) { Err("error: use: skin <name>"); return; }
     CBaseModelInfo* mi = CModelInfo::ms_modelInfoPtrs[id];
     if (!mi || mi->GetModelType() != eModelInfoType::MODEL_INFO_PED) { Err("error: not a ped model"); return; }
 
@@ -146,67 +117,69 @@ void CmdChangeMe(const Args& a) {
             return;
         }
     }
-    if (FindPlayerPed(0) != p) { Err("error: player changed while loading"); return; }
-
     SwapPlayerModel(p, id);
     if (id != 0) CStreaming::SetModelIsDeletable(id);
     Ok("model -> " + std::to_string(id));
 }
-//    -------------------------------------------    ---------------------------------
 
 void CmdSkin(const Args& a) {
     if (!a.Has(1)) { Usage("skin <name>"); return; }
     const std::string name = ToUpper(a[1]);
 
-    if (name.empty() || name.size() > 8 ||
-        !std::all_of(name.begin(), name.end(), [](unsigned char c) {
-            return std::isalnum(c) != 0;
-        })) {
-        Err("error: name must be 1-8 letters/digits");
-        return;
-    }
-
     CPlayerPed* p = RequirePlayer();
     if (!p) return;
 
-    const int slot = PickSpecialSlot(*p);
-    if (slot < 0) {
-        Err("error: no free special slot");
-        return;
-    }
-
-    // Request and block until loaded. GAME_REQUIRED prevents the engine from deleting it immediately.
-    CStreaming::RequestSpecialModel(slot, name.c_str(), GAME_REQUIRED);
+    // 1. Load special char by name into Special 01 (Slot 1)
+    CStreaming::RequestSpecialChar(1, name.c_str(), GAME_REQUIRED);
+    
+    // 2. Load it normally (blocks until streamed)
     CStreaming::LoadAllRequestedModels(false);
 
-    // Verify it actually loaded
-    if (!CStreaming::HasSpecialCharLoaded(slot)) {
-        CStreaming::SetSpecialCharIsDeletable(slot);
+    // 3. Verify it loaded
+    if (!CStreaming::HasSpecialCharLoaded(1)) {
+        CStreaming::SetSpecialCharIsDeletable(1);
         Err("error: model '" + name + "' failed to load");
         return;
     }
 
-    // Apply it.
-    const int modelId = 289 + slot;
-    SwapPlayerModel(p, modelId);
-    CStreaming::SetSpecialCharIsDeletable(slot);
+    // 4. Swap player model to 290 (Special 01)
+    SwapPlayerModel(p, 290);
     
+    // 5. Unload the slot (the player's reference keeps the model in memory)
+    CStreaming::SetSpecialCharIsDeletable(1);
+
     AddToHistory("skin applied -> " + name, kColGreen);
 }
 
-//    --------------------------------------------    ---------------------------
 bool IsValidWeaponId(int id) { return id >= 0 && id <= kMaxWeaponId && !(id >= 19 && id <= 21); }
 
 void CmdWeapon(const Args& a) {
     if (!a.Has(1)) { Usage("weapon <id|name> [ammo]"); return; }
 
     int id = -1;
-    if (IsNumber(a[1])) { if (!ParseInt(a[1], id)) id = -1; }
-    else id = GetWeaponIdByName(a[1]);
+    std::string nameStr;
+
+    if (IsNumber(a[1])) {
+        if (!ParseInt(a[1], id)) id = -1;
+    } else {
+        // Reconstruct name for weapons with spaces (e.g., "desert eagle")
+        nameStr = std::string(a[1]);
+        for (size_t i = 2; i < a.n; ++i) {
+            if (IsNumber(a[i])) break; // Stop at ammo argument
+            nameStr += " " + std::string(a[i]);
+        }
+        id = GetWeaponIdByName(nameStr);
+    }
+
     if (!IsValidWeaponId(id)) { Err("error: invalid weapon id"); return; }
 
     int ammo = 500;
-    if (a.Has(2) && !ParseInt(a[2], ammo)) { Err("error: invalid ammo"); return; }
+    for (size_t i = 2; i < a.n; ++i) {
+        if (IsNumber(a[i])) {
+            if (!ParseInt(a[i], ammo)) ammo = 500;
+            break;
+        }
+    }
     ammo = std::clamp(ammo, 1, 99999);
 
     CPlayerPed* p = RequirePlayer(kAllowVehicle);
@@ -215,9 +188,11 @@ void CmdWeapon(const Args& a) {
     CWeaponInfo* wi = CWeaponInfo::GetWeaponInfo((eWeaponType)id);
     if (!wi) { Err("error: weapon info missing"); return; }
 
+    // --- CRITICAL FIX: Load the weapon model BEFORE giving it to the player ---
     const int models[2] = { wi->m_nModelId, wi->m_nModelId2 };
     for (int m : models) if (m > 0 && m < kMaxModels) CStreaming::RequestModel(m, GAME_REQUIRED);
     CStreaming::LoadAllRequestedModels(false);
+    
     for (int m : models) {
         if (m > 0 && m < kMaxModels && !ModelLoaded(m)) {
             for (int r : models) if (r > 0 && r < kMaxModels) CStreaming::SetModelIsDeletable(r);
@@ -225,13 +200,29 @@ void CmdWeapon(const Args& a) {
             return;
         }
     }
-    if (FindPlayerPed(0) != p) { Err("error: player changed while loading"); return; }
+    // -------------------------------------------------------------------------
 
     p->GiveWeapon((eWeaponType)id, ammo, true);
     p->SetCurrentWeapon((eWeaponType)id);
+    
+    // Mark models as deletable (the player's hand now holds a reference)
     for (int m : models) if (m > 0 && m < kMaxModels) CStreaming::SetModelIsDeletable(m);
 
     Ok("weapon -> " + std::to_string(id) + " (ammo " + std::to_string(ammo) + ")");
+}
+
+void CmdFightStyle(const Args& a) {
+    int style;
+    if (!ParseInt(a[1], style) || style < 4 || style > 16) {
+        Usage("fightstyle <4-16>");
+        Err("valid styles: 4-16");
+        return;
+    }
+    CPlayerPed* p = RequirePlayer(kAllowVehicle);
+    if (!p) return;
+    
+    p->m_nFightingStyle = (unsigned char)style;
+    Ok("fight style -> " + std::to_string(style));
 }
 
 bool IsTrainModel(int id) { return id == 537 || id == 538 || id == 569 || id == 570 || id == 590; }
@@ -245,23 +236,17 @@ void CmdVeh(const Args& a) {
     if (id < kFirstVehicle || id > kLastVehicle) { Err("error: invalid vehicle id"); return; }
     if (IsTrainModel(id)) { Err("error: trains can't be spawned"); return; }
 
-    CBaseModelInfo* mi = CModelInfo::ms_modelInfoPtrs[id];
-    if (!mi || mi->GetModelType() != eModelInfoType::MODEL_INFO_VEHICLE) { Err("error: not a vehicle model"); return; }
-
     if (!RequirePlayer(kAllowVehicle)) return;
     
-    // Spawn the vehicle
     CCheat::VehicleCheat(id);
     
-    // Check for nitro in any of the remaining arguments
     bool wantNitro = false;
     for (size_t i = 2; i <= 4; ++i) {
         if (a.Has(i) && ToLower(a[i]) == "nitro") { wantNitro = true; break; }
     }
     if (wantNitro) {
-        if (CVehicle* v = GetPlayerVehicle()) v->AddVehicleUpgrade(1010); // 1010 = NITRO
+        if (CVehicle* v = GetPlayerVehicle()) v->AddVehicleUpgrade(1010);
     }
-    
     Ok("spawned " + std::to_string(id));
 }
 
@@ -278,13 +263,8 @@ void CmdTp(const Args& a) {
     CPlayerPed* p = RequirePlayer(kAllowVehicle);
     if (!p) return;
 
-    // Clear the area to prevent physics collisions on teleport
     CWorld::ClearExcitingStuffFromArea(CVector(x, y, z), 10.0f, false);
-    
-    // Teleport player
     p->Teleport(CVector(x, y, z), false);
-    
-    // Teleport vehicle if driving
     if (CVehicle* v = GetPlayerVehicle()) v->Teleport(CVector(x, y, z), false);
 
     char buf[64];
@@ -332,11 +312,13 @@ void CmdWeather(const Args& a) {
     CWeather::ForceWeatherNow((short)id);
     Ok("weather -> " + std::to_string(id));
 }
+
 constexpr int kDoorNode[6] = { 9, 18, 16, 12, 17, 13 };
 
 bool DoorAvailable(CVehicle* v, int door) {
     return v->IsComponentPresent(kDoorNode[door]) && !v->IsDoorMissing((eDoors)door);
 }
+
 void CmdDoor(const Args& a) {
     int d;
     if (!ParseInt(a[1], d) || d < -1 || d > 5) { Usage("door <0-5 or -1 for all>"); return; }
@@ -346,26 +328,22 @@ void CmdDoor(const Args& a) {
     CPlayerPed* p = FindPlayerPed(0);
 
     if (d == -1) {
-        // Toggle all doors
         static bool allOpen = false;
         allOpen = !allOpen;
         for (int i = 0; i <= 5; ++i) {
             if (DoorAvailable(v, i)) {
-                // Passing the player and true for playSound fixes the visual rotation
                 v->OpenDoor(p, kDoorNode[i], (eDoors)i, allOpen ? 1.0f : 0.0f, true);
             }
         }
         Ok(allOpen ? "opened all doors" : "closed all doors");
     } else {
-        // Toggle specific door
         if (!DoorAvailable(v, d)) { Err("error: this vehicle has no such door"); return; }
-        
         bool isClosed = v->IsDoorClosed((eDoors)d);
         v->OpenDoor(p, kDoorNode[d], (eDoors)d, isClosed ? 1.0f : 0.0f, true);
-        
         Ok(isClosed ? "opened door " + std::to_string(d) : "closed door " + std::to_string(d));
     }
 }
+
 void CmdHp(const Args& a) {
     int val;
     if (!ParseInt(a[1], val)) { Usage("hp <value>"); return; }
@@ -460,17 +438,6 @@ void CmdDb(const Args& a) {
     }
 }
 
-#define PED_ANIM_GROUP(p) ((p)->m_nAnimGroup)
-
-bool SetWalkStyle(CPed* p, std::string_view name) {
-    const std::string n(name);
-    const int grp = (int)CAnimManager::GetFirstAssocGroup(n.c_str());
-    if (grp < 0 || grp >= (int)CAnimManager::ms_numAnimAssocDefinitions) return false;
-    PED_ANIM_GROUP(p) = grp;
-    ReapplyMoveAnims(*p);
-    return true;
-}
-
 void CmdWalkStyle(const Args& a) {
     static constexpr std::string_view kGroups[] = {
         "man", "fatman", "oldman", "oldfatman", "gang1", "gang2",
@@ -496,18 +463,11 @@ void CmdWalkStyle(const Args& a) {
     }
 
     p->m_nAnimGroup = grpId;
-
-    // FIX: Declare 'walkAnim' here using CAnimManager::BlendAnimation
-    CAnimBlendAssociation* walkAnim = CAnimManager::BlendAnimation(
-        p->m_pRwClump, 
-        grpId, 
-        0,       // 0 = ANIM_WALK
-        4.0f     // Blend delta
-    );
+    CAnimBlendAssociation* walkAnim = CAnimManager::BlendAnimation(p->m_pRwClump, grpId, 0, 4.0f);
     
     if (walkAnim) {
         walkAnim->m_bLooped = true; 
-        Ok("walkstyle -> " + groupName + " (blended)");
+        Ok("walkstyle -> " + groupName);
     } else {
         Err("error: failed to blend walk animation");
     }
@@ -525,7 +485,7 @@ void CmdHelp(const Args&) {
     AddToHistory("changeme / skin / weapon / veh / tp", kColGreen);
     AddToHistory("weather / door / hp / armor / money", kColGreen);
     AddToHistory("lock / engine / light / vcol", kColGreen);
-    AddToHistory("gamespeed / time / star", kColGreen);
+    AddToHistory("gamespeed / time / star / fightstyle", kColGreen);
     AddToHistory("pim / vim / db / ws", kColGreen);
     AddToHistory("clear / exit", kColGreen);
 }
@@ -541,59 +501,83 @@ constexpr Cmd kCmds[] = {
     { "weather", CmdWeather }, { "door", CmdDoor }, { "hp", CmdHp }, { "armor", CmdArmor },
     { "money", CmdMoney }, { "star", CmdStar }, { "pim", CmdPim }, { "vim", CmdVim },
     { "db", CmdDb }, { "ws", CmdWalkStyle }, { "walkstyle", CmdWalkStyle },
-    { "clear", CmdClear }, { "help", CmdHelp }, { "exit", CmdExit },
+    { "fightstyle", CmdFightStyle }, { "clear", CmdClear }, { "help", CmdHelp }, { "exit", CmdExit },
 };
 
 } // namespace
 
 // ---------------------------------------------------------------- tab completion
+std::string GetLongestCommonPrefix(const std::vector<std::string>& strs) {
+    if (strs.empty()) return "";
+    std::string prefix = strs[0];
+    for (size_t i = 1; i < strs.size(); ++i) {
+        while (strs[i].find(prefix) != 0) {
+            prefix.pop_back();
+            if (prefix.empty()) return "";
+        }
+    }
+    return prefix;
+}
+
 bool CompleteCommand(std::string& input) {
     if (input.empty()) return false;
 
-    // Auto-complete vehicles: "veh <name>"
-    if (input.starts_with("veh ")) {
-        std::string prefix = input.substr(4);
+    std::string cmdPart = input;
+    std::string argPart = "";
+    size_t spacePos = input.find(' ');
+    if (spacePos != std::string::npos) {
+        cmdPart = input.substr(0, spacePos);
+        argPart = input.substr(spacePos + 1);
+    }
+
+    std::vector<std::string> matches;
+
+    if (cmdPart == "veh" && !argPart.empty()) {
         for (int i = kFirstVehicle; i <= kLastVehicle; ++i) {
             CBaseModelInfo* mi = CModelInfo::ms_modelInfoPtrs[i];
             if (mi && mi->GetModelType() == eModelInfoType::MODEL_INFO_VEHICLE) {
                 auto* vmi = reinterpret_cast<CVehicleModelInfo*>(mi);
                 if (vmi->m_szGameName) {
                     std::string name = ToLower(vmi->m_szGameName);
-                    if (name.starts_with(prefix)) {
-                        input = "veh " + name;
-                        return true;
-                    }
+                    if (name.starts_with(argPart)) matches.push_back(name);
                 }
             }
         }
-        return false;
-    }
-
-    // Auto-complete weapons: "wep <name>" or "weapon <name>"
-    if (input.starts_with("wep ") || input.starts_with("weapon ")) {
-        std::string prefix = input.substr(input.find(' ') + 1);
-        static const char* weps[] = {
-            "unarmed", "brassknuckle", "golfclub", "nightstick", "knife", "baseballbat", "shovel",
-            "poolcue", "katana", "chainsaw", "dildo", "flowers", "cane", "grenade", "teargas",
-            "molotov", "rocket", "pistol", "silenced", "deagle", "shotgun", "sawnoff",
-            "spas12", "uzi", "tec9", "mp5", "ak47", "m4", "rifle", "sniper",
-            "rpg", "flamethrower", "minigun", "satchel", "detonator", "spraycan", "extinguisher",
-            "camera", "nvg", "infrared", "parachute"
+    } 
+       else if ((cmdPart == "wep" || cmdPart == "weapon") && !argPart.empty()) {
+        // These are the EXACT string names the game's CWeaponInfo::FindWeaponType expects
+                static const char* weps[] = {
+            "unarmed", "brassknuckle", "golfclub", "nightstick", "knife", "baseballbat",
+            "shovel", "poolcue", "katana", "chainsaw", "dildo", "dildo2", "vibrator",
+            "vibrator2", "flowers", "cane", "grenade", "teargas", "molotov", "rocket",
+            "pistol", "pistol_silenced", "desert_eagle", "shotgun", "sawnoff",
+            "spas12", "micro_uzi", "tec9", "mp5", "ak47", "m4", "countryrifle",
+            "sniperrifle", "rpg", "flamethrower", "minigun", "satchel",
+            "detonator", "spraycan", "extinguisher", "camera", "nvg", "infrared", "parachute"
         };
         for (const auto* w : weps) {
             std::string wname = ToLower(w);
-            if (wname.starts_with(prefix)) {
-                input = (input.starts_with("wep ") ? "wep " : "weapon ") + wname;
-                return true;
-            }
+            if (wname.starts_with(argPart)) matches.push_back(wname);
         }
-        return false;
+    }
+    else if (spacePos == std::string::npos) {
+        for (const Cmd& c : kCmds) {
+            if (c.name.starts_with(input)) matches.push_back(std::string(c.name));
+        }
     }
 
-    // Auto-complete base commands
-    if (input.find(' ') != std::string::npos) return false;
-    for (const Cmd& c : kCmds) {
-        if (c.name.starts_with(input)) { input.assign(c.name); input += ' '; return true; }
+    if (matches.empty()) return false;
+    if (matches.size() == 1) {
+        if (spacePos == std::string::npos) input = matches[0] + " ";
+        else input = cmdPart + " " + matches[0] + " ";
+        return true;
+    }
+
+    std::string prefix = GetLongestCommonPrefix(matches);
+    if (spacePos == std::string::npos) {
+        if (prefix.length() > input.length()) { input = prefix; return true; }
+    } else {
+        if (prefix.length() > argPart.length()) { input = cmdPart + " " + prefix; return true; }
     }
     return false;
 }

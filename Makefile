@@ -2,7 +2,8 @@
 # Standalone Makefile for saterminal (Incremental Builds)
 # ============================================================================
 
-SDK_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
+#SDK_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../..)
+SDK_DIR := /home/halano/code/plugin-sdk-sa
 PREFIX ?= i686-w64-mingw32-
 CXX    := $(PREFIX)g++
 
